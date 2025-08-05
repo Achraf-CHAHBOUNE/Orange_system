@@ -1,0 +1,1993 @@
+📁 extractor
+    📁 src
+        📁 utils
+            📄 config.py
+                import os
+                from dotenv import load_dotenv
+                import re
+                from typing import Dict, Pattern
+                from datetime import datetime
+                
+                
+                # Load environment variables
+                load_dotenv()
+                
+                # Source MySQL Configuration (Company Server)
+                SOURCE_MYSQL_HOST: str = os.getenv("SOURCE_MYSQL_HOST")
+                SOURCE_MYSQL_USER: str = os.getenv("SOURCE_MYSQL_USER")
+                SOURCE_MYSQL_PASSWORD: str = os.getenv("SOURCE_MYSQL_PASSWORD")
+                SOURCE_MYSQL_PORT: int = int(os.getenv("SOURCE_MYSQL_PORT", 3306))
+                SOURCE_MYSQL_DB: str = os.getenv("SOURCE_MYSQL_DB")
+                
+                # Destination MySQL Configuration (Target Server)
+                
+                DEST_MYSQL_HOST: str = os.getenv("DEST_MYSQL_HOST", "localhost")
+                DEST_MYSQL_USER: str = os.getenv("DEST_MYSQL_USER", "root")
+                DEST_MYSQL_PASSWORD: str = os.getenv("DEST_MYSQL_PASSWORD", "")
+                DEST_MYSQL_PORT: int = int(os.getenv("DEST_MYSQL_PORT", 3306))
+                DEST_MYSQL_DB: str = os.getenv("DEST_MYSQL_DB")
+                
+                # Source Configuration
+                SOURCE_CONFIG = {
+                    'host': SOURCE_MYSQL_HOST,
+                    'user': SOURCE_MYSQL_USER,
+                    'password': SOURCE_MYSQL_PASSWORD,
+                    'port': SOURCE_MYSQL_PORT,
+                    'database': SOURCE_MYSQL_DB
+                }
+                
+                # Destination Configuration
+                DESTINATION_CONFIG = {
+                    'host': DEST_MYSQL_HOST,
+                    'user': DEST_MYSQL_USER,
+                    'password': DEST_MYSQL_PASSWORD,
+                    'port': DEST_MYSQL_PORT,
+                    'database': DEST_MYSQL_DB
+                }
+                
+                
+                # Data patterns
+                patterns: Dict[str, Pattern] = {
+                    '5min': re.compile(r'^(CALIS|MEIND|RAIND)[-_]APG43[_-]5_S\d+_A\d{4}$', re.IGNORECASE),
+                    '15min': re.compile(r'^(CALIS|MEIND|RAIND)[-_]APG43[_-]15_S\d+_A\d{4}$', re.IGNORECASE),
+                    'mgw': re.compile(r'^([A-Za-z0-9]+)MGW_S\d+_A\d{4}$', re.IGNORECASE)
+                }
+                
+                # The Date to start extracting data
+                START_DATE: datetime = datetime(2024, 1, 1)  # change as needed
+                
+                
+                # Paths to store and load the extracted data
+                files_paths: Dict[str, str] = {
+                    '5min': './data/our_data/result_5min.txt',
+                    '15min': './data/our_data/result_15min.txt',
+                    'mgw': './data/our_data/result_mgw.txt',
+                    'last_extracted': './data/last_extracted.json'
+                }
+            📄 extractor.py
+                import time
+                from utils.tools import connect_database, process_tables_names, store_txt, extract_table_data
+                from utils.config import patterns, START_DATE
+                from utils.logger import setup_logging
+                
+                # Logging setup
+                logger = setup_logging("Extractor")
+                
+                class Extractor:
+                    def __init__(self, config):
+                        self.config = config
+                        self.db = None
+                        self.cursor = None
+                        self.tables = None
+                        self.connect()
+                
+                    def connect(self):
+                        """Connect to the database."""
+                        self.db = connect_database(self.config)  # Retries handled in tools.py
+                        self.cursor = self.db.cursor()
+                
+                    def extract_tables_names(self):
+                        """Extract all table names from the database and store them in a file."""
+                        try:
+                            self.cursor.execute("SHOW TABLES")
+                            tables = [table[0] for table in self.cursor.fetchall()]
+                            tables_file_path = "./data/our_tables/tables.txt"
+                            store_txt(tables, tables_file_path)
+                            self.tables = tables
+                            logger.info(f"Extracted {len(tables)} table names")
+                        except Exception as e:
+                            logger.error(f"Error extracting table names: {e}")
+                            raise
+                
+                    def process_tables_names(self):
+                        """Process table names by filtering and sorting them."""
+                        try:
+                            self.extract_tables_names()
+                            tables_names = process_tables_names(self.tables, patterns, START_DATE)
+                            logger.info(f"Processed table names: {tables_names}")
+                            return tables_names
+                        except Exception as e:
+                            logger.error(f"Error processing table names: {e}")
+                            raise
+                
+                    def extract_table_data(self, table_name, offset, batch_size=5000):
+                        """Extract data from a specific table in batches with retries."""
+                        max_retries = 3
+                        retry_delay = 4
+                
+                        for attempt in range(max_retries + 1):
+                            try:
+                                data = extract_table_data(table_name, self.cursor, offset, batch_size)
+                                return data
+                            except Exception as e:
+                                if attempt < max_retries:
+                                    wait_time = retry_delay * (2 ** attempt)
+                                    logger.warning(f"Retry {attempt + 1}/{max_retries} for table '{table_name}' after error: {e}. Waiting {wait_time}s...")
+                                    time.sleep(wait_time)
+                                else:
+                                    logger.error(f"Max retries ({max_retries}) reached for table '{table_name}': {e}")
+                                    raise
+            📄 loader.py
+                from utils.tools import connect_database, load_batch_into_database
+                from utils.logger import setup_logging
+                
+                # Logging setup
+                logger = setup_logging("Loader")
+                
+                class Loader:
+                    def __init__(self, config):
+                        self.config = config
+                        self.db = None
+                        self.cursor = None
+                        self.connect()
+                
+                    def connect(self):
+                        """Connect to the database."""
+                        self.db = connect_database(self.config)  # Retries handled in tools.py
+                        self.cursor = self.db.cursor()
+                
+                    def load_batch_into_database(self, table_name, data):
+                        """Load a batch of data into the database."""
+                        try:
+                            load_batch_into_database(data, self.db, table_name)
+                        except Exception as e:
+                            logger.error(f"Error loading batch into table {table_name}: {e}")
+                            raise
+            📄 logger.py
+                import logging
+                import os
+                from datetime import datetime
+                from logging.handlers import RotatingFileHandler
+                
+                def setup_logging(module_name, log_dir="./logs/Extractor"):
+                    """
+                    Set up logging to write to a rotating daily file in a module-specific subfolder and to the console.
+                    
+                    Args:
+                        module_name (str): Name of the module (e.g., 'Extractor', 'Loader').
+                        log_dir (str): Base directory where module-specific log subfolders will be stored.
+                    
+                    Returns:
+                        logging.Logger: Configured logger instance.
+                    """
+                    # Create module-specific log subfolder (e.g., ./logs/Extractor/Extractor/)
+                    module_log_dir = os.path.join(log_dir, module_name)
+                    os.makedirs(module_log_dir, exist_ok=True)
+                
+                    # Daily log filename (e.g., extractor_20250428.log)
+                    date_str = datetime.now().strftime("%Y%m%d")
+                    log_filename = f"{module_name.lower()}_{date_str}.log"
+                    log_path = os.path.join(module_log_dir, log_filename)
+                
+                    # Create a logger
+                    logger = logging.getLogger(module_name)
+                    logger.setLevel(logging.INFO)
+                    logger.handlers.clear()  # Prevent duplicate logs
+                
+                    # Create rotating file handler
+                    file_handler = RotatingFileHandler(
+                        log_path,
+                        maxBytes=50 * 1024 * 1024,  # 50 MB
+                        backupCount=5               # keep 5 backups
+                    )
+                    file_handler.setLevel(logging.INFO)
+                
+                    # Create console handler
+                    console_handler = logging.StreamHandler()
+                    console_handler.setLevel(logging.INFO)
+                
+                    # Define log format
+                    log_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+                    file_handler.setFormatter(log_format)
+                    console_handler.setFormatter(log_format)
+                
+                    # Add handlers to logger
+                    logger.addHandler(file_handler)
+                    logger.addHandler(console_handler)
+                
+                    # Log the first message if the file is new or empty
+                    if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+                        logger.info(f"Logging initialized for {module_name}. Logs are being written to: {log_path}")
+                
+                    return logger
+            📄 orchestrator.py
+                from utils.extractor import Extractor
+                from utils.loader import Loader
+                from utils.config import SOURCE_CONFIG, DESTINATION_CONFIG
+                from utils.tools import load_last_extracted, save_last_extracted, connect_database
+                from utils.logger import setup_logging
+                
+                # Logging setup
+                logger = setup_logging("Orchestrator")
+                class Orchestrator:
+                    def __init__(self):
+                        self.extractor = Extractor(SOURCE_CONFIG)
+                        self.loader = Loader(DESTINATION_CONFIG)
+                        self.batch_size = 500000
+                
+                    def get_total_rows(self, table, db_connection):
+                        """Get the total number of rows in the source table."""
+                        cursor = db_connection.cursor()
+                        try:
+                            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                            total_rows = cursor.fetchone()[0]
+                            logger.info(f"Total rows in table '{table}': {total_rows}")
+                            return total_rows
+                        except Exception as e:
+                            logger.error(f"Error fetching row count for table {table}: {e}")
+                            raise
+                        finally:
+                            cursor.close()
+                
+                    def process_table_completely(self, table):
+                        """Process a single table completely before moving to the next."""
+                        offset = 0
+                        total_extracted = 0
+                        last_extracted_info = load_last_extracted()
+                        
+                        if table in last_extracted_info and "offset" in last_extracted_info[table]:
+                            offset = last_extracted_info[table]["offset"]
+                            total_extracted = offset
+                            logger.info(f"Resuming extraction for '{table}' from offset {offset}")
+                
+                        source_db = connect_database(SOURCE_CONFIG)
+                        total_rows = self.get_total_rows(table, source_db)
+                
+                        while True:
+                            data = self.extractor.extract_table_data(table, offset, self.batch_size)
+                            logger.info(f"Processing table '{table}' at offset {offset}")
+                            
+                            if not data:
+                                logger.info(f"No more data to process for table '{table}'")
+                                break
+                
+                            self.loader.load_batch_into_database(table, data)
+                            offset += len(data)
+                            total_extracted += len(data)
+                
+                            percentage = (total_extracted / total_rows) * 100 if total_rows > 0 else 0
+                            last_extracted_info[table] = {
+                                "offset": offset,
+                                "total_extracted": total_extracted,
+                                "total_rows": total_rows,
+                                "percentage": round(percentage, 2)
+                            }
+                            save_last_extracted(last_extracted_info)
+                            logger.info(f"Progress: Extracted {total_extracted}/{total_rows} rows ({percentage:.2f}%) from '{table}'")
+                
+                            # if total_extracted >= total_rows:
+                            if total_extracted >= total_rows:
+                                logger.info(f"Table '{table}' fully extracted ({total_extracted}/{total_rows} rows)")
+                                break
+                
+                        last_extracted_info[table]["completed"] = True
+                        save_last_extracted(last_extracted_info)
+                        source_db.close()
+                
+                    def process_orchestration(self):
+                        """Orchestrate the extraction and loading process."""
+                        try:
+                            tables = self.extractor.process_tables_names()
+                            last_extracted_info = load_last_extracted()
+                
+                            for table in tables:
+                                if table in last_extracted_info and last_extracted_info[table].get("completed", False):
+                                    logger.info(f"Skipping table '{table}' - already fully processed")
+                                    continue
+                                
+                                logger.info(f"Starting full extraction for table '{table}'")
+                                self.process_table_completely(table)
+                        
+                        except Exception as e:
+                            logger.error(f"Error during orchestration: {e}")
+                            raise
+                
+            📄 tools.py
+                import MySQLdb
+                import pandas as pd
+                import re
+                import json
+                import os
+                from typing import List, Dict, Any, Optional
+                from tenacity import retry, stop_after_attempt, wait_exponential
+                from utils.config import files_paths as output_paths
+                from utils.logger import setup_logging
+                from datetime import datetime
+                import math
+                
+                
+                # logger setup
+                logger = setup_logging("Tools")
+                @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+                def connect_database(config: Dict[str, Any]):
+                    """Connect to the database using mysqlclient with retries.
+                    
+                    Args:
+                        config: Dictionary with host, user, password, port, and database details.
+                    
+                    Returns:
+                        MySQLdb connection object.
+                    
+                    Raises:
+                        MySQLdb.Error: If connection fails after retries.
+                    """
+                    try:
+                        conn = MySQLdb.connect(
+                            host=config['host'],
+                            user=config['user'],
+                            passwd=config['password'],
+                            port=config['port'],
+                            db=config['database']
+                        )
+                        logger.info(f"Successfully connected to database: {config['database']} on {config['host']}")
+                        return conn
+                    except MySQLdb.Error as e:
+                        logger.error(f"Failed to connect {config['database']}")
+                        logger.error(f"Database connection error: {e}")
+                        raise
+                
+                def store_json(data: Any, filename: str):
+                    """Store data in a JSON file.
+                    
+                    Args:
+                        data: Data to store.
+                        filename: Path to the JSON file.
+                    """
+                    try:
+                        with open(filename, 'w') as f:
+                            json.dump(data, f, indent=4)
+                        logger.info(f"Stored data to JSON file: {filename}")
+                    except Exception as e:
+                        logger.error(f"Error storing JSON to {filename}: {e}")
+                        raise
+                
+                def load_json(filename: str) -> Any:
+                    """Load data from a JSON file.
+                    
+                    Args:
+                        filename: Path to the JSON file.
+                    
+                    Returns:
+                        Loaded data from the file.
+                    """
+                    try:
+                        with open(filename, 'r') as f:
+                            data = json.load(f)
+                        logger.info(f"Loaded data from JSON file: {filename}")
+                        return data
+                    except FileNotFoundError:
+                        logger.warning(f"JSON file not found: {filename}, returning None")
+                        return None
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON in {filename}: {e}")
+                        raise
+                
+                def store_csv(data: List[List[str]], filename: str):
+                    """Store data in a CSV file.
+                    
+                    Args:
+                        data: List of rows to store.
+                        filename: Path to the CSV file.
+                    """
+                    try:
+                        with open(filename, 'w') as f:
+                            for row in data:
+                                f.write(','.join(map(str, row)) + '\n')
+                        logger.info(f"Stored data to CSV file: {filename}")
+                    except Exception as e:
+                        logger.error(f"Error storing CSV to {filename}: {e}")
+                        raise
+                
+                def load_csv(filename: str) -> List[List[str]]:
+                    """Load data from a CSV file.
+                    
+                    Args:
+                        filename: Path to the CSV file.
+                    
+                    Returns:
+                        List of rows from the file.
+                    """
+                    try:
+                        data = []
+                        with open(filename, 'r') as f:
+                            for line in f:
+                                data.append(line.strip().split(','))
+                        logger.info(f"Loaded {len(data)} rows from CSV file: {filename}")
+                        return data
+                    except FileNotFoundError:
+                        logger.warning(f"CSV file not found: {filename}, returning empty list")
+                        return []
+                    except Exception as e:
+                        logger.error(f"Error loading CSV from {filename}: {e}")
+                        raise
+                
+                def store_txt(data: List[str], filename: str):
+                    """Store data in a text file.
+                    
+                    Args:
+                        data: List of strings to store.
+                        filename: Path to the text file.
+                    """
+                    try:
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
+                        with open(filename, 'w') as f:
+                            f.write('\n'.join(data))
+                        logger.info(f"Stored {len(data)} lines to text file: {filename}")
+                    except Exception as e:
+                        logger.error(f"Error storing text to {filename}: {e}")
+                        raise
+                def load_txt(filename: str) -> List[str]:
+                    """Load data from a text file.
+                    
+                    Args:
+                        filename: Path to the text file.
+                    
+                    Returns:
+                        List of lines from the file.
+                    """
+                    try:
+                        with open(filename, 'r') as f:
+                            data = f.read().splitlines()
+                        logger.info(f"Loaded {len(data)} lines from text file: {filename}")
+                        return data
+                    except FileNotFoundError:
+                        logger.warning(f"Text file not found: {filename}, returning empty list")
+                        return []
+                    except Exception as e:
+                        logger.error(f"Error loading text from {filename}: {e}")
+                        raise
+                
+                def filter_tables(table_names: List[str], pattern: re.Pattern) -> List[str]:
+                    """Filter table names based on a regex pattern.
+                    
+                    Args:
+                        table_names: List of table names to filter.
+                        pattern: Compiled regex pattern to match against.
+                    
+                    Returns:
+                        Filtered list of table names.
+                    """
+                    filtered = [table for table in table_names if re.match(pattern, table)]
+                    logger.info(f"Filtered {len(filtered)} tables matching pattern {pattern.pattern}")
+                    return filtered
+                
+                def filter_by_start_date(tables: List[str], start_date: datetime) -> List[str]:
+                    """Filter tables by full start date (year, month, day) using S{week}_A{year}."""
+                    filtered_tables = []
+                    for table in tables:
+                        match = re.search(r'_S(\d+)_A(\d{4})$', table, re.IGNORECASE)
+                        if match:
+                            week = int(match.group(1))
+                            year = int(match.group(2))
+                            try:
+                                table_date = datetime.strptime(f"{year}-W{week}-1", "%Y-W%W-%w")  # Monday of week
+                                if table_date >= start_date:
+                                    filtered_tables.append(table)
+                                    logger.info(f"Including table '{table}' with date {table_date.date()}")
+                                else:
+                                    logger.info(f"Skipping table '{table}' with date {table_date.date()} before {start_date.date()}")
+                            except ValueError as ve:
+                                logger.warning(f"Invalid date for table '{table}': {ve}")
+                        else:
+                            logger.warning(f"Skipping table '{table}' - no week/year format matched")
+                    return filtered_tables
+                
+                def sort_by_year_and_week(tables: List[str]) -> List[str]:
+                    """Sort tables by year and week.
+                    
+                    Args:
+                        tables: List of table names to sort.
+                    
+                    Returns:
+                        Sorted list of table names.
+                    """
+                    try:
+                        sorted_tables = sorted(tables, key=lambda x: (
+                            int(re.search(r'_A(\d{4})$', x, re.IGNORECASE).group(1)),
+                            int(re.search(r'_S(\d+)_', x, re.IGNORECASE).group(1))
+                        ))
+                        logger.info(f"Sorted {len(sorted_tables)} tables by year and week")
+                        return sorted_tables
+                    except Exception as e:
+                        logger.error(f"Error sorting tables: {e}")
+                        raise
+                
+                def process_tables_names(table_names: List[str], patterns: Dict[str, re.Pattern], START_DATE: datetime) -> List[str]:
+                    """Process table names by filtering and sorting them.
+                    
+                    Args:
+                        table_names: List of all table names from the database.
+                        patterns: Dictionary of regex patterns for filtering.
+                        start_year: Minimum year to include.
+                    
+                    Returns:
+                        Unified sorted list of filtered table names.
+                    """
+                    filtered_5min = filter_tables(table_names, patterns['5min'])
+                    filtered_15min = filter_tables(table_names, patterns['15min'])
+                    filtered_mgw = filter_tables(table_names, patterns['mgw'])
+                    
+                    logger.info(f"Found {len(filtered_5min)} 5-minute tables: {filtered_5min}")
+                    logger.info(f"Found {len(filtered_15min)} 15-minute tables: {filtered_15min}")
+                    logger.info(f"Found {len(filtered_mgw)} MGW tables: {filtered_mgw}")
+                
+                    filtered_5min_by_date = filter_by_start_date(filtered_5min, START_DATE)
+                    filtered_15min_by_date = filter_by_start_date(filtered_15min, START_DATE)
+                    filtered_mgw_by_date = filter_by_start_date(filtered_mgw, START_DATE)
+                    
+                    sorted_5min = sort_by_year_and_week(filtered_5min_by_date)
+                    sorted_15min = sort_by_year_and_week(filtered_15min_by_date)
+                    sorted_mgw = sort_by_year_and_week(filtered_mgw_by_date)
+                
+                
+                    store_txt(sorted_5min, output_paths['5min'])
+                    store_txt(sorted_15min, output_paths['15min'])
+                    store_txt(sorted_mgw, output_paths['mgw'])
+                
+                    logger.info(f"Filtered 5-minute results saved to {output_paths['5min']}")
+                    logger.info(f"Filtered 15-minute results saved to {output_paths['15min']}")
+                    logger.info(f"Filtered MGW results saved to {output_paths['mgw']}")
+                
+                    total_tables = len(sorted_5min) + len(sorted_15min) + len(sorted_mgw)
+                    logger.info(f"Total tables found: {total_tables}")
+                    
+                    # unified_sorted_tables = sorted_5min + sorted_15min + sorted_mgw
+                    unified_sorted_tables = sorted_5min 
+                    unified_sorted_tables = sort_by_year_and_week(unified_sorted_tables)
+                    logger.info(f"Returning unified sorted list with lenght of: {len(unified_sorted_tables)}")
+                    return unified_sorted_tables
+                
+                def load_indicator_csv(table: str) -> Dict[int, str]:
+                    """Load indicator data from CSV with headers into a dictionary.
+                    
+                    Args:
+                        table: Table name to derive the CSV filename from.
+                    
+                    Returns:
+                        Dictionary mapping ID_indicateur to indicateur.
+                    """
+                    base_table_name = re.sub(r'_s\d+_a\d{4}$', '', table, flags=re.IGNORECASE)
+                    csv_path = f"./data/indicators/indicateur_{base_table_name}.csv"
+                    if not os.path.exists(csv_path):
+                        logger.warning(f"Indicator CSV not found: {csv_path}, returning empty dict")
+                        return {}
+                    
+                    try:
+                        df = pd.read_csv(csv_path, dtype={'ID_indicateur': int, 'indicateur': str, 'type': str})
+                        indicator_map = dict(zip(df['ID_indicateur'], df['indicateur']))
+                        logger.info(f"Loaded indicator map from {csv_path} with {len(indicator_map)} entries")
+                        return indicator_map
+                    except Exception as e:
+                        logger.error(f"Error loading CSV {csv_path}: {e}")
+                        return {}
+                
+                def load_last_extracted(filename: str = output_paths['last_extracted']) -> Dict[str, Any]:
+                    """Load the last extracted data for each table from a JSON file.
+                    
+                    Args:
+                        filename: Path to the JSON file (default from config).
+                    
+                    Returns:
+                        Dictionary with last extracted info or empty dict if not found/invalid.
+                    """
+                    try:
+                        with open(filename, 'r') as f:
+                            content = f.read().strip()
+                            if not content:
+                                logger.warning(f"{filename} is empty, returning empty dict")
+                                return {}
+                            data = json.loads(content)
+                            logger.info(f"Loaded last extracted info from {filename}")
+                            return data
+                    except FileNotFoundError:
+                        logger.info(f"{filename} not found, returning empty dict")
+                        return {}
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON in {filename}: {e}, returning empty dict")
+                        return {}
+                
+                def save_last_extracted(last_extracted: Dict[str, Any], filename: str = output_paths['last_extracted']):
+                    """Save the last extracted data for each table to a JSON file.
+                    
+                    Args:
+                        last_extracted: Dictionary with extraction info.
+                        filename: Path to the JSON file (default from config).
+                    """
+                    try:
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
+                        with open(filename, 'w') as f:
+                            json.dump(last_extracted, f, indent=4)
+                        logger.info(f"Saved last extracted info to {filename}")
+                    except Exception as e:
+                        logger.error(f"Error saving last extracted to {filename}: {e}")
+                        raise
+                def extract_table_data(table: str, cursor, offset: int, batch_size: int = 5000) -> Optional[List[tuple]]:
+                    """Extract raw data from table in batches based on offset.
+                    
+                    Args:
+                        table: Name of the table to extract from.
+                        cursor: Database cursor to execute queries.
+                        offset: Starting row offset for the batch.
+                        batch_size: Number of rows to fetch per batch (default: 5000).
+                    
+                    Returns:
+                        List of tuples (date_heure, indicateur, valeur) or None if no data.
+                    """
+                    query = f"""
+                        SELECT date_heure, ID_indicateur, valeur
+                        FROM {table}
+                        ORDER BY date_heure
+                        LIMIT {batch_size} OFFSET {offset}
+                    """
+                    try:
+                        cursor.execute(query)
+                        raw_data = cursor.fetchall()
+                        logger.info(f"Executed query for {table} at offset {offset}, fetched {len(raw_data)} rows")
+                    except MySQLdb.Error as e:
+                        logger.error(f"SQL error for table {table}: {e}")
+                        return None
+                    
+                    if not raw_data:
+                        logger.info(f"No data fetched for table {table} at offset {offset}")
+                        return None
+                    
+                    indicator_map = load_indicator_csv(table)
+                    if not indicator_map:
+                        logger.error(f"Cannot proceed without indicator mapping for {table}")
+                        return None
+                    
+                    result = []
+                    for date_heure, id_indicateur, valeur in raw_data:
+                        indicateur = indicator_map.get(id_indicateur, "Unknown")
+                        result.append((date_heure, indicateur, valeur))
+                    
+                    logger.info(f"Processed {len(result)} rows for {table} with indicator mapping")
+                    return result
+                
+                # def load_batch_into_database(batch: List[tuple], target_db, target_table: str):
+                #     """Load a batch of data into the target database.
+                    
+                #     Args:
+                #         batch: List of tuples (date_heure, indicateur, valeur) to load.
+                #         target_db: Target database connection.
+                #         target_table: Name of the table to load into.
+                #     """
+                #     cursor = target_db.cursor()
+                #     try:
+                #         cursor.execute(f"SHOW TABLES LIKE '{target_table}'")
+                #         if not cursor.fetchone():
+                #             create_query = f"""
+                #                 CREATE TABLE {target_table} (
+                #                     Date DATETIME,
+                #                     indicateur VARCHAR(255),
+                #                     valeur FLOAT
+                #                 )
+                #             """
+                #             cursor.execute(create_query)
+                #             target_db.commit()
+                #             logger.info(f"Created table {target_table}")
+                
+                #         columns = ['Date', 'indicateur', 'valeur']
+                #         placeholders = ', '.join(['%s'] * len(batch[0]))
+                #         insert_query = f"INSERT INTO {target_table} ({', '.join(columns)}) VALUES ({placeholders})"
+                #         cursor.executemany(insert_query, batch)
+                #         target_db.commit()
+                #         logger.info(f"Successfully loaded {len(batch)} rows into {target_table}")
+                #     except MySQLdb.Error as e:
+                #         logger.error(f"Error loading batch into {target_table}: {e}")
+                #         target_db.rollback()
+                #         raise
+                #     finally:
+                #         cursor.close()
+                
+                def load_batch_into_database(batch: List[tuple], target_db, target_table: str):
+                    """
+                    Load a batch of data into the target database, converting any float('nan')
+                    values to None so they insert as SQL NULL.
+                    """
+                    cursor = target_db.cursor()
+                    try:
+                        # Create table if it doesn't exist
+                        cursor.execute(f"SHOW TABLES LIKE '{target_table}'")
+                        if not cursor.fetchone():
+                            create_query = f"""
+                                CREATE TABLE {target_table} (
+                                    Date DATETIME,
+                                    indicateur VARCHAR(255),
+                                    valeur FLOAT
+                                )
+                            """
+                            cursor.execute(create_query)
+                            target_db.commit()
+                            logger.info(f"Created table {target_table}")
+                
+                        # Prepare INSERT
+                        columns = ['Date', 'indicateur', 'valeur']
+                        placeholders = ', '.join(['%s'] * len(batch[0]))
+                        insert_query = f"INSERT INTO {target_table} ({', '.join(columns)}) VALUES ({placeholders})"
+                
+                # â€”â€” SANITIZE NaNs â€”â€”
+                        sanitized_batch = []
+                        for row in batch:
+                            sanitized_row = []
+                            for val in row:
+                                if isinstance(val, float) and math.isnan(val):
+                                    sanitized_row.append(None)
+                                else:
+                                    sanitized_row.append(val)
+                            sanitized_batch.append(tuple(sanitized_row))
+                
+                        # Execute
+                        cursor.executemany(insert_query, sanitized_batch)
+                        target_db.commit()
+                        logger.info(f"Successfully loaded {len(sanitized_batch)} rows into {target_table}")
+                
+                    except MySQLdb.Error as e:
+                        logger.error(f"Error loading batch into {target_table}: {e}")
+                        target_db.rollback()
+                        raise
+                    finally:
+                        cursor.close()
+        📄 main.py
+            from utils.orchestrator import Orchestrator
+            from utils.logger import setup_logging
+            
+            
+            
+            # Logging setup
+            logger = setup_logging("Main")
+            
+            def main():
+                """Main function to run the ETL process."""
+                logger.info("Starting ETL process...")
+                orchestrator = Orchestrator()
+                orchestrator.process_orchestration()
+                logger.info("ETL process completed.")
+            
+            
+            
+            if __name__ == "__main__":
+                main()
+    📄 Dockerfile
+        FROM python:3.12-slim
+        
+        # Install build dependencies for mysqlclient and numpy
+        
+        RUN apt-get update && apt-get install -y gcc python3-dev libmariadb-dev libmariadb-dev-compat pkg-config && rm -rf /var/lib/apt/lists/*
+        
+        WORKDIR /app 
+        
+        COPY requirements.txt . 
+        
+        RUN pip install --no-cache-dir -r requirements.txt 
+        
+        COPY src/ . 
+         
+    📄 requirements.txt
+        mysqlclient==2.2.7
+        numpy==2.2.5 
+        pandas==2.2.3 
+        python-dateutil==2.9.0.post0 
+        python-dotenv==1.1.0 
+        pytz==2025.2 
+        six==1.17.0 
+        tenacity==9.1.2 
+        tzdata==2025.2
+📁 manager
+    📁 dags
+        📄 etl_pipeline.py
+            from airflow import DAG
+            from airflow.operators.bash import BashOperator
+            from airflow.operators.python import PythonOperator
+            from datetime import datetime, timedelta
+            import json
+            import os
+            from utils.logger import setup_logging
+            
+            # Initialize logger
+            logger = setup_logging('ETL_Pipeline', log_dir='./logs/Manager')
+            
+            default_args = {
+                'owner': 'airflow',
+                'depends_on_past': False,
+                'retries': 1,
+                'retry_delay': timedelta(minutes=1),
+                'email_on_failure': False,
+                'email_on_retry': False,
+            }
+            
+            def check_extraction_completion():
+                last_extracted_path = '/opt/airflow/data/last_extracted.json'
+                
+                logger.info(f"Checking for last_extracted.json at {last_extracted_path}")
+                
+                # Check if file exists
+                if not os.path.exists(last_extracted_path):
+                    logger.warning(f"File {last_extracted_path} does not exist. Assuming no tables to process.")
+                    print("No extraction data found. Proceeding with pipeline.")
+                    return
+                
+                # Check if file is empty
+                if os.path.getsize(last_extracted_path) == 0:
+                    logger.warning(f"File {last_extracted_path} is empty. Assuming no tables to process.")
+                    print("Empty extraction data. Proceeding with pipeline.")
+                    return
+                
+                try:
+                    with open(last_extracted_path, 'r') as f:
+                        logger.info(f"Reading contents of {last_extracted_path}")
+                        content = f.read().strip()
+                        if not content:
+                            logger.warning(f"File {last_extracted_path} contains only whitespace. Assuming no tables to process.")
+                            print("Whitespace-only extraction data. Proceeding with pipeline.")
+                            return
+                        logger.info(f"File contents: {content}")
+                        f.seek(0)  # Reset file pointer for json.load
+                        data = json.load(f)
+                    
+                    logger.info(f"Loaded last_extracted.json: {data}")
+                    if not data:
+                        logger.warning(f"last_extracted.json is an empty dictionary. Assuming no tables to process.")
+                        print("No tables found in extraction data. Proceeding with pipeline.")
+                        return
+                    
+                    # Check if any tables were not fully extracted
+                    for table, info in data.items():
+                        if not info.get('completed', False):
+                            logger.error(f"Table {table} not fully extracted: {info}")
+                            raise ValueError(f"Table {table} not fully extracted")
+                    
+                    logger.info("All tables fully extracted")
+                    print("All tables fully extracted")
+                
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse {last_extracted_path}: {str(e)}")
+                    raise ValueError(f"Failed to parse {last_extracted_path}: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Extraction check failed: {str(e)}")
+                    raise Exception(f"Extraction check failed: {str(e)}")
+                
+                logger.info("Extraction check completed successfully")
+            
+            with DAG(
+                dag_id='etl_pipeline',
+                default_args=default_args,
+                description='ETL pipeline triggering existing Docker containers',
+                schedule='*/5 * * * *',
+                start_date=datetime(2025, 5, 5),
+                catchup=False,
+                tags=['etl'],
+            ) as dag:
+            
+                check_containers = BashOperator(
+                    task_id='check_containers',
+                    bash_command='docker ps | grep -q etl-extractor- && docker ps | grep -q etl-transformer- || { echo "Container check failed"; exit 1; } && echo "Containers etl-extractor- and etl-transformer- are running"',
+                    do_xcom_push=True,
+                    on_success_callback=lambda context: logger.info(f"check_containers succeeded: {context['task_instance'].xcom_pull(task_ids='check_containers')}"),
+                    on_failure_callback=lambda context: logger.error(f"check_containers failed: {context['exception']}"),
+                )
+            
+                run_extractor = BashOperator(
+                    task_id='run_extractor',
+                    bash_command='docker exec etl-extractor-1 python /app/main.py && echo "Extractor execution completed"',
+                    do_xcom_push=True,
+                    on_success_callback=lambda context: logger.info(f"run_extractor succeeded: {context['task_instance'].xcom_pull(task_ids='run_extractor')}"),
+                    on_failure_callback=lambda context: logger.error(f"run_extractor failed: {context['exception']}"),
+                )
+            
+                check_extraction = PythonOperator(
+                    task_id='check_extraction',
+                    python_callable=check_extraction_completion,
+                    on_success_callback=lambda context: logger.info("check_extraction succeeded"),
+                    on_failure_callback=lambda context: logger.error(f"check_extraction failed: {context['exception']}"),
+                )
+            
+                run_transformer = BashOperator(
+                    task_id='run_transformer',
+                    bash_command='docker exec etl-transformer-1 python /app/main.py && echo "Transformer execution completed"',
+                    do_xcom_push=True,
+                    on_success_callback=lambda context: logger.info(f"run_transformer succeeded: {context['task_instance'].xcom_pull(task_ids='run_transformer')}"),
+                    on_failure_callback=lambda context: logger.error(f"run_transformer failed: {context['exception']}"),
+                )
+            
+                clear_intermediate_table = BashOperator(
+                    task_id='clear_intermediate_table',
+                    bash_command='docker exec etl-mysql-1 mysql -uroot -p${MYSQL_ROOT_PASSWORD} -e "SET FOREIGN_KEY_CHECKS=0; DROP DATABASE IF EXISTS 5min_transform; CREATE DATABASE 5min_transform; SET FOREIGN_KEY_CHECKS=1;" && echo "Intermediate table cleared"',
+                    do_xcom_push=True,
+                    on_success_callback=lambda context: logger.info(f"clear_intermediate_table succeeded: {context['task_instance'].xcom_pull(task_ids='clear_intermediate_table')}"),
+                    on_failure_callback=lambda context: logger.error(f"clear_intermediate_table failed: {context['exception']}"),
+                )
+            
+                check_containers >> run_extractor >> check_extraction >> run_transformer >> clear_intermediate_table
+    📁 utils
+        📄 logger.py
+            import logging
+            import os
+            from datetime import datetime
+            from logging.handlers import RotatingFileHandler
+            
+            def setup_logging(module_name, log_dir="./logs/Manager"):
+                """
+                Set up logging to write to a rotating daily file in a module-specific subfolder and to the console.
+            
+                Args:
+                    module_name (str): Name of the module (e.g., 'Extractor', 'Loader').
+                    log_dir (str): Base directory where module-specific log subfolders will be stored.
+            
+                Returns:
+                    logging.Logger: Configured logger instance.
+                """
+                # Create module-specific log subfolder (e.g., ./logs/Manager/Manager/)
+                module_log_dir = os.path.join(log_dir, module_name)
+                os.makedirs(module_log_dir, exist_ok=True)
+            
+                # Daily log filename (e.g., manager_20250804.log)
+                date_str = datetime.now().strftime("%Y%m%d")
+                log_filename = f"{module_name.lower()}_{date_str}.log"
+                log_path = os.path.join(module_log_dir, log_filename)
+            
+                # Create logger
+                logger = logging.getLogger(module_name)
+                logger.setLevel(logging.INFO)
+                logger.handlers.clear()  # Clear existing handlers to avoid duplicates
+            
+                # Create rotating file handler (50MB max, 5 backups)
+                file_handler = RotatingFileHandler(
+                    log_path,
+                    maxBytes=50 * 1024 * 1024,  # 50 MB per file
+                    backupCount=5,              # Keep 5 backups
+                    encoding='utf-8'
+                )
+                file_handler.setLevel(logging.INFO)
+            
+                # Create console handler
+                console_handler = logging.StreamHandler()
+                console_handler.setLevel(logging.INFO)
+            
+                # Define log format
+                log_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+                file_handler.setFormatter(log_format)
+                console_handler.setFormatter(log_format)
+            
+                # Add handlers
+                logger.addHandler(file_handler)
+                logger.addHandler(console_handler)
+            
+                # Log initialization (only if file is new or empty)
+                if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+                    logger.info(f"Logging initialized for {module_name}. Logs are being written to: {log_path}")
+            
+                return logger
+    📄 Dockerfile
+        # Use the official Airflow 2.7.3 image
+        FROM apache/airflow:2.7.3
+        
+        # Switch to root to copy, set permissions, and install packages
+        USER root
+        
+        # Copy entrypoint script, DAGs, and utils directories
+        COPY entrypoint.sh /entrypoint.sh
+        COPY dags/ /opt/airflow/dags/
+        COPY utils/ /opt/airflow/dags/utils/
+        
+        # Make entrypoint script executable and set permissions
+        RUN chmod +x /entrypoint.sh && \
+            chmod -R 755 /opt/airflow/dags && \
+            chmod -R 755 /opt/airflow/dags/utils
+        
+        # Install Docker CLI
+        RUN apt-get update && \
+            apt-get install -y docker.io && \
+            apt-get clean && \
+            rm -rf /var/lib/apt/lists/*
+        
+        # Debug: List DAGs and utils directory contents
+        RUN ls -l /opt/airflow/dags && \
+            ls -l /opt/airflow/dags/utils
+        
+        # Switch back to airflow user for runtime
+        USER airflow
+        
+        # Install pymysql and apache-airflow-providers-docker
+        RUN pip install --no-cache-dir pymysql==1.1.0 apache-airflow-providers-docker==3.4.0
+        
+        # Set entrypoint
+        ENTRYPOINT ["/entrypoint.sh"]
+    📄 entrypoint.sh
+        #!/bin/bash
+        
+        set -e
+        
+        echo "Checking MySQL connection for Airflow..."
+        mysqladmin -h host.docker.internal -P 3306 -u airflow -pairflow ping || { echo "MySQL ping failed"; exit 1; }
+        
+        echo "Checking if Airflow database is initialized..."
+        if airflow db check; then
+            echo "Airflow database already initialized, skipping init..."
+        else
+            echo "Running airflow db init..."
+            airflow db init || { echo "airflow db init failed"; exit 1; }
+        fi
+        
+        echo "Running airflow db migrate..."
+        airflow db migrate || { echo "airflow db migrate failed"; exit 1; }
+        
+        echo "Creating default connections..."
+        airflow connections create-default-connections
+        
+        echo "Checking if admin user exists..."
+        if airflow users list | grep -q "admin"; then
+            echo "Admin user already exists, skipping creation..."
+        else
+            echo "Creating admin user..."
+            airflow users create \
+                --username admin \
+                --password admin \
+                --firstname Admin \
+                --lastname Admin \
+                --role Admin \
+                --email admin@example.com || { echo "Admin user creation failed"; exit 1; }
+        fi
+        
+        echo "Checking DAG file presence..."
+        ls -l /opt/airflow/dags || { echo "DAGs directory not found"; exit 1; }
+        if [ -f /opt/airflow/dags/etl_pipeline.py ]; then
+            echo "etl_pipeline.py found, validating syntax..."
+            python /opt/airflow/dags/etl_pipeline.py || { echo "Syntax error in etl_pipeline.py"; exit 1; }
+        else
+            echo "etl_pipeline.py not found in /opt/airflow/dags"
+            exit 1
+        fi
+        
+        echo "Starting webserver and scheduler in background..."
+        airflow webserver & airflow scheduler &
+        
+        echo "Waiting for scheduler to scan DAGs (60 seconds)..."
+        sleep 60
+        
+        echo "Checking if etl_pipeline is registered..."
+        airflow dags list | grep etl_pipeline || { echo "etl_pipeline not registered in DagModel"; exit 1; }
+        
+        echo "Triggering etl_pipeline DAG..."
+        airflow dags trigger etl_pipeline || { echo "Failed to trigger etl_pipeline DAG"; exit 1; }
+        
+        echo "Keeping container running..."
+        wait
+📁 transformer
+    📁 src
+        📁 utils
+            📄 config.py
+                import re
+                from dotenv import load_dotenv
+                import os
+                
+                # Load environment variables
+                load_dotenv()
+                
+                # Database connection parameters
+                SOURCE_DB_HOST = os.getenv("SOURCE_DB_HOST", "localhost")
+                SOURCE_DB_USER = os.getenv("SOURCE_DB_USER", "root")
+                SOURCE_DB_PASSWORD = os.getenv("SOURCE_DB_PASSWORD", "")
+                SOURCE_DB_PORT = int(os.getenv("SOURCE_DB_PORT", 3306))
+                SOURCE_DB_NAME = os.getenv("SOURCE_MYSQL_DB_NAME")
+                
+                DEST_DB_HOST = os.getenv("DEST_DB_HOST")
+                DEST_DB_USER = os.getenv("DEST_DB_USER")
+                DEST_DB_PASSWORD = os.getenv("DEST_DB_PASSWORD")
+                DEST_DB_PORT = int(os.getenv("DEST_DB_PORT", 3306))
+                DEST_DB_NAME_5MIN = os.getenv("DEST_MYSQL_DB_5MIN")
+                DEST_DB_NAME_15MIN = os.getenv("DEST_MYSQL_DB_15MIN")
+                DEST_DB_NAME_MGW = os.getenv("DEST_MYSQL_DB`_MGW")
+                
+                # Source Database config
+                SOURCE_DB_CONFIG = {
+                    'host': SOURCE_DB_HOST,
+                    'user': SOURCE_DB_USER,
+                    'password': SOURCE_DB_PASSWORD,
+                    'port': SOURCE_DB_PORT,
+                    'database': SOURCE_DB_NAME
+                }
+                
+                # Destination Database configs
+                DEST_DB_CONFIG_5MIN = {
+                    'host': DEST_DB_HOST,
+                    'user': DEST_DB_USER,
+                    'password': DEST_DB_PASSWORD,
+                    'port': DEST_DB_PORT,
+                    'database': DEST_DB_NAME_5MIN
+                }
+                
+                DEST_DB_CONFIG_15MIN = {
+                    'host': DEST_DB_HOST,
+                    'user': DEST_DB_USER,
+                    'password': DEST_DB_PASSWORD,
+                    'port': DEST_DB_PORT,
+                    'database': DEST_DB_NAME_15MIN
+                }
+                
+                DEST_DB_CONFIG_MGW = {
+                    'host': DEST_DB_HOST,
+                    'user': DEST_DB_USER,
+                    'password': DEST_DB_PASSWORD,
+                    'port': DEST_DB_PORT,
+                    'database': DEST_DB_NAME_MGW
+                }
+                
+                # Node patterns
+                NOEUD_PATTERN = re.compile(r'^(CALIS|MEIND|RAIND)', re.IGNORECASE)
+                NOEUD_PATTERN_MGW = re.compile(r'^(MGW)', re.IGNORECASE)
+                
+                # Files config
+                FILES_PATHS = {
+                    '5min': './data/our_data/result_5min.txt',
+                    '15min': './data/our_data/result_15min.txt',
+                    'mgw': './data/our_data/result_mgw.txt',
+                    'last_extracted': './data/last_extracted.json'
+                }
+                
+                # Suffix to operator mapping
+                SUFFIX_OPERATOR_MAPPING = {
+                    'nw': 'Inwi',
+                    'mt': 'Maroc Telecom',
+                    'ie': 'International',
+                    'is': 'International',
+                    'bs': 'BSC 2G',
+                    'be': 'BSC 2G',
+                    'ne': 'RNC 3G',
+                    'ns': 'RNC 3G'
+                }
+                
+                # Table definitions with KPIs for 5min
+                tables_5min = {
+                    'traffic_entree': {
+                        'kpis': {
+                            'traffic': {
+                                'numerator': ['VoiproITRALAC'],
+                                'formula': lambda num: sum(num)
+                            },
+                            'tentative_appel': {
+                                'numerator': ['VoiproNCALLSI'],
+                                'formula': lambda num: sum(num)
+                            },
+                            'appel_repondu': {
+                                'numerator': ['VoiproIANSWER'],
+                                'formula': lambda num: sum(num)
+                            },
+                            'appel_non_repondu': {
+                                'numerator': ['VoiproIOVERFL'],
+                                'formula': lambda num: sum(num)
+                            }
+                        }
+                    },
+                    'traffic_sortie': {
+                        'kpis': {
+                            'traffic': {
+                                'numerator': ['VoiproOTRALAC'],
+                                'formula': lambda num: sum(num)
+                            },
+                            'tentative_appel': {
+                                'numerator': ['VoiproNCALLSO'],
+                                'formula': lambda num: sum(num)
+                            },
+                            'appel_repondu': {
+                                'numerator': ['VoiproOANSWER'],
+                                'formula': lambda num: sum(num)
+                            },
+                            'appel_non_repondu': {
+                                'numerator': ['VoiproOOVERFL'],
+                                'formula': lambda num: sum(num)
+                            }
+                        }
+                    }
+                }
+                
+                # Table definitions with KPIs for MGW
+                tables_mgw = {
+                    'mgw_kpis': {
+                        'kpis': {
+                            'RateOfLowJitterStream': {
+                                'numerator': [
+                                    'pmVoIpConnMeasuredJitter4',
+                                    'pmVoIpConnMeasuredJitter5',
+                                    'pmVoIpConnMeasuredJitter6',
+                                    'pmVoIpConnMeasuredJitter7',
+                                    'pmVoIpConnMeasuredJitter8'
+                                ],
+                                'denominator': [
+                                    'pmVoIpConnMeasuredJitter0',
+                                    'pmVoIpConnMeasuredJitter1',
+                                    'pmVoIpConnMeasuredJitter2',
+                                    'pmVoIpConnMeasuredJitter3',
+                                    'pmVoIpConnMeasuredJitter4',
+                                    'pmVoIpConnMeasuredJitter5',
+                                    'pmVoIpConnMeasuredJitter6',
+                                    'pmVoIpConnMeasuredJitter7',
+                                    'pmVoIpConnMeasuredJitter8'
+                                ],
+                                'formula': lambda num, denom: (1 - sum(num) / sum(denom)) * 100 if sum(denom) != 0 else None
+                            },
+                            'UseOfLicence': {
+                                'numerator': ['pmNrOfMeStChUsedVoip'],
+                                'denominator': ['maxNrOfLicMediaStreamChannelsVoip'],
+                                'formula': lambda num, denom: (sum(num) / sum(denom)) * 100 if sum(denom) != 0 else None
+                            },
+                            'LatePktsRatio': {
+                                'numerator': [
+                                    'pmVoIpConnLatePktsRatio4',
+                                    'pmVoIpConnLatePktsRatio5',
+                                    'pmVoIpConnLatePktsRatio6'
+                                ],
+                                'denominator': [
+                                    'pmVoIpConnLatePktsRatio0',
+                                    'pmVoIpConnLatePktsRatio1',
+                                    'pmVoIpConnLatePktsRatio2',
+                                    'pmVoIpConnLatePktsRatio3',
+                                    'pmVoIpConnLatePktsRatio4',
+                                    'pmVoIpConnLatePktsRatio5',
+                                    'pmVoIpConnLatePktsRatio6'
+                                ],
+                                'formula': lambda num, denom: (1 - sum(num) / sum(denom)) * 100 if sum(denom) != 0 else None
+                            },
+                            'LatePktsVoIp': {
+                                'numerator': ['pmLatePktsVoIp'],
+                                'denominator': ['pmLatePktsVoIp', 'pmSuccTransmittedPktsVoIp'],
+                                'formula': lambda num, denom: sum(num) / sum(denom) if sum(denom) != 0 else None
+                            },
+                            'MediaStreamChannelUtilisationRate': {
+                                'numerator': ['pmNrOfMediaStreamChannelsBusy'],
+                                'denominator': ['maxNrOfLicMediaStreamChannels'],
+                                'formula': lambda num, denom: (sum(num) / sum(denom)) * 100 if sum(denom) != 0 else None
+                            },
+                            'IPQoS': {
+                                'numerator': [],
+                                'formula': lambda num: None
+                            },
+                            'PktLoss': {
+                                'numerator': ['pmRtpDiscardedPkts', 'pmRtpLostPkts'],
+                                'denominator': ['pmRtpReceivedPktsHi', 'pmRtpReceivedPktsLo', 'pmRtpLostPkts'],
+                                'formula': lambda num, denom: (sum(num) / ((denom[0] * 2147483648 + denom[1]) + denom[2])) * 100 if ((denom[0] * 2147483648 + denom[1]) + denom[2]) != 0 else None
+                            },
+                            'pmRtpReceivedPkts': {
+                                'numerator': ['pmRtpReceivedPktsHi', 'pmRtpReceivedPktsLo'],
+                                'formula': lambda num: (num[0] * 2147483648 + num[1])
+                            },
+                            'TotalBwForSig': {
+                                'numerator': ['pmSctpStatSentChunks', 'pmSctpStatRetransChunks'],
+                                'denominator': [],
+                                'formula': lambda num: (sum(num) / (1000000 * 900)) * 8 * 100 * 1.2
+                            },
+                            'NbIPTermination': {
+                                'numerator': ['pmNrOfIpTermsReq', 'pmNrOfIpTermsRej'],
+                                'formula': lambda num: num[0] - num[1]
+                            },
+                            'traffic_load': {
+                                'numerator': ['traffic_load'],
+                                'formula': lambda num: sum(num)
+                            }
+                        }
+                    }
+                }
+                
+                # Collect counters for 5min
+                ALL_COUNTERS_5MIN = set()
+                for table_config in tables_5min.values():
+                    for kpi_config in table_config['kpis'].values():
+                        ALL_COUNTERS_5MIN.update(kpi_config.get('numerator', []) + kpi_config.get('denominator', []))
+                ALL_COUNTERS_5MIN = list(ALL_COUNTERS_5MIN)
+                
+                # Collect counters for MGW
+                ALL_COUNTERS_MGW = set()
+                for table_config in tables_mgw.values():
+                    for kpi_config in table_config['kpis'].values():
+                        ALL_COUNTERS_MGW.update(kpi_config.get('numerator', []) + kpi_config.get('denominator', []))
+                ALL_COUNTERS_MGW = list(ALL_COUNTERS_MGW)
+                
+                # Configuration dictionary
+                CONFIGS = {
+                    '5min': {
+                        'source_db_config': SOURCE_DB_CONFIG,
+                        'dest_db_config': DEST_DB_CONFIG_5MIN,
+                        'tables': tables_5min,
+                        'all_counters': ALL_COUNTERS_5MIN,
+                        'node_pattern': NOEUD_PATTERN,
+                        'suffix_operator_mapping': SUFFIX_OPERATOR_MAPPING,
+                        'file_path': FILES_PATHS['5min']
+                    }
+                }
+            📄 logger.py
+                import logging
+                import os
+                from datetime import datetime
+                from logging.handlers import RotatingFileHandler
+                
+                def setup_logging(module_name, data_type=None, log_dir="./logs/Transformer"):
+                    """
+                    Set up logging to write to a rotating daily file in a data-type and module-specific subfolder and to the console.
+                
+                    Args:
+                        module_name (str): Name of the module (e.g., 'Main', 'Transformer', 'Tools').
+                        data_type (str, optional): Data type (e.g., '5min', '15min', 'mgw'). 
+                                                   If None, logs go to log_dir/module_name/.
+                        log_dir (str): Base directory where data-type and module-specific log subfolders will be stored.
+                
+                    Returns:
+                        logging.Logger: Configured logger instance.
+                    """
+                    # Build log directory path
+                    if data_type:
+                        module_log_dir = os.path.join(log_dir, data_type, module_name)
+                        logger_name = f"{data_type}.{module_name}"
+                    else:
+                        module_log_dir = os.path.join(log_dir, module_name)
+                        logger_name = module_name
+                
+                    os.makedirs(module_log_dir, exist_ok=True)
+                
+                    # Daily log filename
+                    date_str = datetime.now().strftime("%Y%m%d")
+                    log_filename = f"{module_name.lower()}_{date_str}.log"
+                    log_path = os.path.join(module_log_dir, log_filename)
+                
+                    # Create logger
+                    logger = logging.getLogger(logger_name)
+                    logger.setLevel(logging.INFO)
+                    logger.handlers.clear()  # Prevent duplicate handlers
+                
+                    # Create rotating file handler
+                    file_handler = RotatingFileHandler(
+                        log_path,
+                        maxBytes=50 * 1024 * 1024,  # 50 MB max per file
+                        backupCount=5,              # Keep 5 old log files
+                        encoding='utf-8'
+                    )
+                    file_handler.setLevel(logging.INFO)
+                
+                    # Create console handler
+                    console_handler = logging.StreamHandler()
+                    console_handler.setLevel(logging.INFO)
+                
+                    # Define log format
+                    log_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+                    file_handler.setFormatter(log_format)
+                    console_handler.setFormatter(log_format)
+                
+                    # Add handlers
+                    logger.addHandler(file_handler)
+                    logger.addHandler(console_handler)
+                
+                    # Log initialization message (only for new or empty log files)
+                    if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+                        logger.info(f"Logging initialized for {logger_name}. Logs are being written to: {log_path}")
+                
+                    return logger
+            📄 tools.py
+                import MySQLdb
+                from typing import Dict, Any
+                from tenacity import retry, stop_after_attempt, wait_exponential
+                from utils.logger import setup_logging
+                import re
+                
+                def get_tools_logger(data_type=None):
+                    return setup_logging("Tools", data_type=data_type)
+                
+                @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+                def connect_database(config: Dict[str, Any], data_type=None):
+                    """Connect to the database using mysqlclient with retries."""
+                    logger = get_tools_logger(data_type)
+                    try:
+                        logger.info(f"Connecting to database config: {config}")
+                        conn = MySQLdb.connect(
+                            host=config['host'],
+                            user=config['user'],
+                            passwd=config['password'],
+                            port=config['port'],
+                            db=config['database']
+                        )
+                        logger.info(f"Successfully connected to database: {config['database']} on {config['host']}")
+                        return conn
+                    except MySQLdb.Error as e:
+                        logger.error(f"Database connection error: {e}")
+                        raise
+                
+                def create_tables(cursor, tables: Dict[str, Any], data_type=None):
+                    """Create kpi_summary and tables with suffix column."""
+                    logger = get_tools_logger(data_type)
+                    try:
+                        # Create kpi_summary table
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS kpi_summary (
+                                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                                date DATETIME NOT NULL,
+                                node VARCHAR(50) NOT NULL,
+                                INDEX idx_date_node (date, node)
+                            );
+                        """)
+                        logger.info("Table 'kpi_summary' created or already exists.")
+                
+                        # Create tables with suffix column
+                        for table_name, table_config in tables.items():
+                            columns = [
+                                'id INT NOT NULL AUTO_INCREMENT PRIMARY KEY',
+                                'kpi_id INT NOT NULL',
+                                'operator VARCHAR(50)',
+                                'suffix VARCHAR(255)'
+                            ]
+                            for kpi in table_config['kpis']:
+                                columns.append(f"{kpi} FLOAT")
+                            columns.append('FOREIGN KEY (kpi_id) REFERENCES kpi_summary(id)')
+                            columns.append('INDEX idx_kpi_id_operator_suffix (kpi_id, operator, suffix)')
+                
+                            query = f"""
+                                CREATE TABLE IF NOT EXISTS {table_name} (
+                                    {', '.join(columns)}
+                                );
+                            """
+                            cursor.execute(query)
+                            logger.info(f"Table '{table_name}' created or already exists.")
+                
+                        logger.info("All tables created successfully.")
+                    except MySQLdb.Error as e:
+                        logger.error(f"Error creating tables: {e}")
+                        raise
+                    except Exception as e:
+                        logger.error(f"Unexpected error creating tables: {e}")
+                        raise
+                
+                def extract_noeud(pattern, texts, data_type=None):
+                    """Extracts prefixes from the provided list of texts using the given regex pattern."""
+                    logger = get_tools_logger(data_type)
+                    matches = []
+                    for text in texts:
+                        match = pattern.match(text)
+                        if match:
+                            prefix = match.group(1).upper()
+                            matches.append((text, prefix))
+                            logger.debug(f"Extracted node prefix '{prefix}' from text '{text}'")
+                    return matches
+                
+                def extract_indicateur_suffixe(indicateur, data_type=None):
+                    """Extract the suffix from the KPI name, preserving the full suffix string."""
+                    logger = get_tools_logger(data_type)
+                    if not isinstance(indicateur, str):
+                        logger.error("Indicateur must be a string")
+                        raise ValueError("Indicateur must be a string")
+                    
+                    parts = indicateur.split('.', 1)
+                    if len(parts) != 2:
+                        logger.warning(f"Invalid indicateur format: '{indicateur}'. Expected one '.' separator.")
+                        return parts[0], None
+                    
+                    prefix, suffix = parts
+                    logger.debug(f"Extracted indicateur '{prefix}' with suffix '{suffix}'")
+                    return prefix, suffix
+            📄 transformer.py
+                import pandas as pd
+                from typing import Dict, List, Any, Optional
+                from utils.logger import setup_logging
+                from utils.tools import (
+                    connect_database,
+                    create_tables,
+                    extract_noeud,
+                    extract_indicateur_suffixe,
+                )
+                from tenacity import retry, stop_after_attempt, wait_fixed
+                from time import time, sleep
+                class Transformer:
+                    def __init__(
+                        self,
+                        source_db_config: Dict[str, Any],
+                        dest_db_config: Dict[str, Any],
+                        tables: Dict[str, Any],
+                        all_counters: List[str],
+                        node_pattern: str,
+                        suffix_operator_mapping: Dict[str, Any],
+                        file_path: str,
+                        data_type: str,
+                    ) -> None:
+                        """Initialize the Transformer with database configurations."""
+                        self.source_conn = connect_database(source_db_config, data_type=data_type)
+                        self.source_cursor = self.source_conn.cursor()
+                        self.dest_conn = connect_database(dest_db_config, data_type=data_type)
+                        self.dest_cursor = self.dest_conn.cursor()
+                        self.tables = tables
+                        self.all_counters = all_counters
+                        self.node_pattern = node_pattern
+                        self.suffix_operator_mapping = suffix_operator_mapping
+                        self.file_path = file_path
+                        self.data_type = data_type
+                        self.logger = setup_logging("Transformer", data_type=data_type)
+                        self.source_tables = self.load_tables()
+                        self.batch_size = 98000  # For bulk inserts
+                
+                    def load_tables(self) -> List[str]:
+                        """Load source table names from result_type.txt."""
+                        try:
+                            with open(self.file_path, "r") as f:
+                                tables = [line.strip() for line in f if line.strip()]
+                            if not tables:
+                                self.logger.warning(f"No tables found in {self.file_path}. Check file content or path.")
+                            else:
+                                self.logger.info(f"Loaded {len(tables)} tables from {self.file_path}: {tables}")
+                            return tables
+                        except FileNotFoundError:
+                            self.logger.error(f"Table file not found: {self.file_path}")
+                            raise
+                        except Exception as e:
+                            self.logger.error(f"Error loading tables from file: {e}")
+                            raise
+                
+                    def create_tables(self):
+                        """Create tables in the destination database."""
+                        try:
+                            create_tables(self.dest_cursor, self.tables, self.data_type)
+                            self.dest_conn.commit()
+                            self.logger.info("Tables created successfully in destination database.")
+                        except Exception as e:
+                            self.logger.error(f"Error creating tables in destination database: {e}")
+                            self.dest_conn.rollback()
+                            raise
+                
+                    def get_distinct_dates(self, table: str) -> List[str]:
+                        """Retrieve distinct Date values from a table in the source database."""
+                        try:
+                            query = f"SELECT DISTINCT Date FROM {table} ORDER BY Date"
+                            self.source_cursor.execute(query)
+                            dates = [str(row[0]) for row in self.source_cursor.fetchall()]
+                            self.logger.info(f"Extracted {len(dates)} distinct dates from {table}")
+                            return dates
+                        except Exception as e:
+                            self.logger.error(f"Error getting distinct dates from {table}: {e}")
+                            raise
+                
+                    def extract_node(self, table: str) -> Optional[str]:
+                        """Extract Node from table name."""
+                        matches = extract_noeud(self.node_pattern, [table], self.data_type)
+                        if matches:
+                            node = matches[0][1]
+                            self.logger.info(f"Extracted node '{node}' from table '{table}'")
+                            return node
+                        self.logger.warning(f"No node found in table name: {table}")
+                        return None
+                
+                    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+                    def extract_data(self, table: str, dates: List[str]) -> pd.DataFrame:
+                        """Extract relevant counters for multiple dates from the source database."""
+                        try:
+                            query = f"""
+                                SELECT Date, indicateur, valeur
+                                FROM {table}
+                                WHERE Date IN %s AND ({' OR '.join(['indicateur LIKE %s' for _ in self.all_counters])})
+                            """
+                            params = [tuple(dates)] + [f"{counter}%" for counter in self.all_counters]
+                            self.source_cursor.execute(query, params)
+                            data = self.source_cursor.fetchall()
+                            df = pd.DataFrame(data, columns=["Date", "indicateur", "valeur"])
+                            if df.empty:
+                                self.logger.warning(f"No data found for {table} on dates {dates}")
+                            else:
+                                self.logger.info(f"Extracted {len(df)} rows for {table} on {len(dates)} dates")
+                            return df
+                        except Exception as e:
+                            self.logger.error(f"Error extracting data from {table} for dates {dates}: {e}")
+                            raise
+                
+                    def calculate_kpis(self, counters: Dict[str, float], kpi_configs: Dict[str, Any]) -> Dict[str, float]:
+                        """Calculate KPI values for a table."""
+                        kpi_values = {}
+                        for kpi, config in kpi_configs.items():
+                            try:
+                                numerator = [counters.get(counter, 0) for counter in config.get('numerator', [])]
+                                if 'denominator' in config:
+                                    denominator = [counters.get(counter, 0) for counter in config.get('denominator', [])]
+                                    kpi_values[kpi] = config['formula'](numerator, denominator)
+                                else:
+                                    kpi_values[kpi] = config['formula'](numerator)
+                                self.logger.debug(f"Calculated {kpi}: {kpi_values[kpi]}")
+                            except ZeroDivisionError:
+                                self.logger.warning(f"ZeroDivisionError for {kpi}: denominator={config.get('denominator', [])}")
+                                kpi_values[kpi] = None
+                            except Exception as e:
+                                self.logger.error(f"Error calculating {kpi}: {e}")
+                                kpi_values[kpi] = None
+                        return kpi_values
+                
+                    def aggregate_by_suffix(self, df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+                        """Group counter values by full suffix using vectorized operations."""
+                        try:
+                            df['prefix'], df['suffix'] = zip(*df['indicateur'].apply(lambda x: extract_indicateur_suffixe(x, self.data_type)))
+                            df = df[df['suffix'].notnull() & (df['suffix'] != 'M')]
+                            df['operator'] = df['suffix'].str.lower().apply(
+                                lambda s: next((v for k, v in self.suffix_operator_mapping.items() if k and k.lower() in s), 'Other')
+                            )
+                            grouped_df = df.groupby(['suffix', 'prefix'])['valeur'].sum().unstack(fill_value=0)
+                            grouped = {suffix: {'operator': df[df['suffix'] == suffix]['operator'].iloc[0], 'counters': row.to_dict()}
+                                       for suffix, row in grouped_df.iterrows()}
+                            unmapped = set(df[df['operator'] == 'Other']['suffix'].unique())
+                            if unmapped:
+                                self.logger.warning(f"Unmapped suffixes: {sorted(unmapped)}")
+                            self.logger.info(f"Grouped data by suffixes: {list(grouped.keys())}")
+                            return grouped
+                        except Exception as e:
+                            self.logger.error(f"Error aggregating by suffix: {str(e)}")
+                            raise
+                
+                    def insert_kpi_summary(self, date: str, node: str) -> int:
+                        """Insert or retrieve kpi_summary ID for a date-node pair."""
+                        try:
+                            query = "SELECT id FROM kpi_summary WHERE date = %s AND node = %s"
+                            self.dest_cursor.execute(query, (date, node))
+                            result = self.dest_cursor.fetchone()
+                            if result:
+                                kpi_id = result[0]
+                                self.logger.debug(f"Found existing kpi_summary ID={kpi_id} for Date={date}, Node={node}")
+                                return kpi_id
+                
+                            query = "INSERT INTO kpi_summary (date, node) VALUES (%s, %s)"
+                            self.dest_cursor.execute(query, (date, node))
+                            self.dest_cursor.execute("SELECT LAST_INSERT_ID()")
+                            kpi_id = self.dest_cursor.fetchone()[0]
+                            self.logger.info(f"Inserted into kpi_summary: Date={date}, Node={node}, ID={kpi_id}")
+                            return kpi_id
+                        except Exception as e:
+                            self.logger.error(f"Error in kpi_summary upsert: {e}")
+                            raise
+                
+                    def insert_kpi_details(self, table_name: str, batch: List[Dict[str, Any]]):
+                        """Insert batch of KPI values into the specified table with full suffix."""
+                        try:
+                            kpi_configs = self.tables[table_name]['kpis']
+                            columns = ['kpi_id', 'operator', 'suffix'] + list(kpi_configs.keys())
+                            params = ['%s'] * len(columns)
+                            query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(params)})"
+                            values = []
+                            for row in batch:
+                                valid_kpis = {kpi: value for kpi, value in row['kpi_values'].items() if value is not None}
+                                if not valid_kpis:
+                                    self.logger.warning(f"No valid KPI values for {table_name}: kpi_id={row['kpi_id']}, operator={row['operator']}, suffix={row['suffix']}")
+                                    continue
+                                row_values = [row['kpi_id'], row['operator'], row['suffix']] + [valid_kpis.get(kpi, None) for kpi in kpi_configs]
+                                values.append(tuple(row_values))
+                            if values:
+                                self.dest_cursor.executemany(query, values)
+                                self.dest_conn.commit()
+                                self.logger.info(f"Inserted batch of {len(values)} rows into {table_name}")
+                        except Exception as e:
+                            self.logger.error(f"Error inserting into {table_name}: {e}")
+                            self.dest_conn.rollback()
+                            raise
+                
+                    def process(self):
+                        """Main process to handle all source tables and insert into destination tables."""
+                        start = time()
+                        self.create_tables()
+                        self.logger.info(f"Table creation: {time() - start:.2f}s")
+                        batch_data = {table_name: [] for table_name in self.tables}
+                
+                        for table in self.source_tables:
+                            table_start = time()
+                            node = self.extract_node(table)
+                            if not node:
+                                continue
+                
+                            dates = self.get_distinct_dates(table)
+                            # dates = dates[1364:]  # Removed test skip for production
+                            
+                            
+                            # # print(f"the first date we will process is {dates[0]}")
+                
+                            
+                            # # sleep(1000000)  # Simulate delay for testing
+                
+                        
+                            # # batch_size = 500 if table in ['traffic_entree', 'traffic_sortie'] else 5
+                            batch_size = 500
+                            date_batches = [dates[i:i + batch_size] for i in range(0, len(dates), batch_size)]
+                            self.logger.info(f"Dates for {table}: {time() - table_start:.2f}s")
+                
+                            for date_batch in date_batches:
+                                batch_start = time()
+                                try:
+                                    df = self.extract_data(table, date_batch)
+                                    self.logger.info(f"Extract {table}/{len(date_batch)} dates: {time() - batch_start:.2f}s")
+                                    if df.empty:
+                                        self.logger.info(f"No data for table {table}, dates {date_batch}")
+                                        continue
+                
+                                    for date, date_df in df.groupby('Date'):
+                                        date_start = time()
+                                        if len(date_df) != 196 and table in ['traffic_entree', 'traffic_sortie']:
+                                            self.logger.warning(f"Expected 196 rows for {table}/{date}, got {len(date_df)}")
+                
+                                        kpi_id = self.insert_kpi_summary(str(date), node)
+                                        suffix_data = self.aggregate_by_suffix(date_df)
+                
+                                        for table_name, table_config in self.tables.items():
+                                            kpi_configs = table_config['kpis']
+                                            for suffix, data in suffix_data.items():
+                                                operator = data['operator']
+                                                kpi_values = self.calculate_kpis(data['counters'], kpi_configs)
+                                                if any(v is not None for v in kpi_values.values()):
+                                                    batch_data[table_name].append({
+                                                        'kpi_id': kpi_id,
+                                                        'operator': operator,
+                                                        'kpi_values': kpi_values,
+                                                        'suffix': suffix
+                                                    })
+                                                    self.logger.debug(f"Added to {table_name} batch: kpi_id={kpi_id}, operator={operator}, suffix={suffix}, kpi_values={kpi_values}")
+                                                else:
+                                                    self.logger.warning(f"No valid KPIs for {table_name}: kpi_id={kpi_id}, operator={operator}, suffix={suffix}")
+                
+                                            if len(batch_data[table_name]) >= self.batch_size:
+                                                try:
+                                                    self.insert_kpi_details(table_name, batch_data[table_name])
+                                                    batch_data[table_name] = []
+                                                except Exception as e:
+                                                    self.logger.error(f"Failed to commit batch for {table_name}: {e}")
+                                                    raise
+                
+                                        self.logger.info(f"Process {table}/{date}: {time() - date_start:.2f}s")
+                
+                                except Exception as e:
+                                    self.logger.error(f"Error processing batch for {table}, dates {date_batch}: {e}")
+                                    raise
+                
+                            
+                            # try:
+                            #     self.insert_kpi_details(table_name, batch_data[table_name])
+                            #     batch_data[table_name] = []
+                            #     self.logger.info(f"Committed final batch of {len(batch_data[table_name])} rows for {table_name}")
+                            # except Exception as e:
+                            #     self.logger.error(f"Failed to commit final batch for {table_name}: {e}")
+                            #     raise
+                            # self.logger.info("stoped change the table")
+                            # sleep(100000)
+                
+                        for table_name in batch_data:
+                            if batch_data[table_name]:
+                                try:
+                                    self.insert_kpi_details(table_name, batch_data[table_name])
+                                    batch_data[table_name] = []
+                                    self.logger.info(f"Committed final batch of {len(batch_data[table_name])} rows for {table_name}")
+                                except Exception as e:
+                                    self.logger.error(f"Failed to commit final batch for {table_name}: {e}")
+                                    raise
+                
+                        self.logger.info(f"Total process: {time() - start:.2f}s")
+                
+                    def __del__(self):
+                        """Cleanup database connections safely."""
+                        try:
+                            if hasattr(self, 'source_cursor') and self.source_cursor:
+                                self.source_cursor.close()
+                            if hasattr(self, 'source_conn') and self.source_conn:
+                                self.source_conn.close()
+                            if hasattr(self, 'dest_cursor') and self.dest_cursor:
+                                self.dest_cursor.close()
+                            if hasattr(self, 'dest_conn') and self.dest_conn:
+                                self.dest_conn.close()
+                            if hasattr(self, 'logger'):
+                                self.logger.info("Database connections closed.")
+                        except Exception as e:
+                            if hasattr(self, 'logger'):
+                                self.logger.error(f"Error closing database connections: {e}")
+                            else:
+                                print(f"Error closing database connections: {e}")
+        📄 main.py
+            import threading
+            from utils.logger import setup_logging
+            from utils.transformer import Transformer
+            from utils.config import CONFIGS
+            
+            def run_transformer(config, data_type):
+                """
+                Main function to run the transformer for a specific data type.
+                
+                Args:
+                    config (dict): Configuration dictionary for the data type.
+                    data_type (str): Type of data being processed (e.g., '5min', '15min', 'mgw').
+                """
+                logger = setup_logging("Main", data_type=data_type)
+                
+                if not config['tables']:
+                    logger.warning(f"Skipping {data_type} processing: Empty tables configuration")
+                    return
+            
+                logger.info(f"Starting processing for {data_type} data")
+                try:
+                    transformer = Transformer(
+                        source_db_config=config['source_db_config'],
+                        dest_db_config=config['dest_db_config'],
+                        tables=config['tables'],
+                        all_counters=config['all_counters'],
+                        node_pattern=config['node_pattern'],
+                        suffix_operator_mapping=config['suffix_operator_mapping'],
+                        file_path=config['file_path'],
+                        data_type=data_type
+                    )
+                    
+                    transformer.process()
+                    logger.info(f"Completed processing for {data_type} data")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {data_type} data: {e}")
+                    raise
+            
+            if __name__ == "__main__":
+                threads = []
+                for data_type, config in CONFIGS.items():
+                    t = threading.Thread(target=run_transformer, args=(config, data_type))
+                    threads.append(t)
+                    t.start()
+            
+                for t in threads:
+                    t.join()
+            
+                logger = setup_logging("Main")
+                logger.info("All threads completed")
+    📄 Dockerfile
+        FROM python:3.12-slim
+        
+        # Install build dependencies for mysqlclient and numpy
+        
+        RUN apt-get update && apt-get install -y gcc python3-dev libmariadb-dev libmariadb-dev-compat pkg-config && rm -rf /var/lib/apt/lists/*
+        
+        WORKDIR /app 
+        
+        COPY requirements.txt . 
+        
+        RUN pip install --no-cache-dir -r requirements.txt 
+        
+        COPY src/ . 
+    📄 requirements.txt
+        mysqlclient==2.2.7
+        numpy==2.2.5 
+        pandas==2.2.3 
+        python-dateutil==2.9.0.post0 
+        python-dotenv==1.1.0 
+        pytz==2025.2 
+        six==1.17.0 
+        tenacity==9.1.2 
+        tzdata==2025.2
+📄 .env
+    COMPOSE_PROJECT_NAME=etl
+    
+    # Source MySQL (Local XAMPP)
+    SOURCE_MYSQL_HOST=host.docker.internal
+    SOURCE_MYSQL_USER=root
+    SOURCE_MYSQL_PASSWORD=
+    SOURCE_MYSQL_PORT=3306
+    SOURCE_MYSQL_DB=5min_new
+    
+    # Intermediate MySQL (Local XAMPP)
+    INTERMEDIATE_MYSQL_HOST=host.docker.internal
+    INTERMEDIATE_MYSQL_USER=root
+    INTERMEDIATE_MYSQL_PASSWORD=
+    INTERMEDIATE_MYSQL_PORT=3306
+    INTERMEDIATE_MYSQL_DB=intermediate_db
+    
+    # Transformer Destination Databases (Local XAMPP)
+    DEST_MYSQL_HOST=host.docker.internal
+    DEST_MYSQL_USER=root
+    DEST_MYSQL_PASSWORD=
+    DEST_MYSQL_PORT=3306
+    DEST_MYSQL_DB_5MIN=5min_transformed
+    DEST_MYSQL_DB_15MIN=15min_transformed
+    DEST_MYSQL_DB_MGW=mgw_transformed
+    
+    # Airflow Database (Local XAMPP)
+    AIRFLOW_MYSQL_HOST=host.docker.internal
+    AIRFLOW_MYSQL_USER=airflow
+    AIRFLOW_MYSQL_PASSWORD=airflow
+    AIRFLOW_MYSQL_PORT=3306
+    AIRFLOW_MYSQL_DB=airflow
+📄 .gitignore
+    # Ignore environment files
+    env
+    .env
+    
+    # ignore data Folder 
+    data
+    data/*
+    data/*.*
+    data/*/*
+    data/*/*.*
+    
+    
+    # Ignore Python cache files
+    __pycache__/
+    *.pyc
+    *.pyo
+📄 docker-compose.yml
+    services:
+      manager:
+        build:
+          context: ./manager
+          dockerfile: Dockerfile
+        environment:
+          - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+          - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=mysql+pymysql://${AIRFLOW_MYSQL_USER}:${AIRFLOW_MYSQL_PASSWORD}@${AIRFLOW_MYSQL_HOST}:${AIRFLOW_MYSQL_PORT}/${AIRFLOW_MYSQL_DB}
+        volumes:
+          - ./data:/opt/airflow/data
+          - ./logs:/opt/airflow/logs
+          - /var/run/docker.sock:/var/run/docker.sock
+        ports:
+          - "8080:8080"
+        networks:
+          - etl_network
+    
+      extractor:
+        build:
+          context: ./extractor
+          dockerfile: Dockerfile
+        environment:
+          - SOURCE_MYSQL_HOST=${SOURCE_MYSQL_HOST}
+          - SOURCE_MYSQL_USER=${SOURCE_MYSQL_USER}
+          - SOURCE_MYSQL_PASSWORD=${SOURCE_MYSQL_PASSWORD}
+          - SOURCE_MYSQL_PORT=${SOURCE_MYSQL_PORT}
+          - SOURCE_MYSQL_DB=${SOURCE_MYSQL_DB}
+          - DEST_MYSQL_HOST=${INTERMEDIATE_MYSQL_HOST}
+          - DEST_MYSQL_USER=${INTERMEDIATE_MYSQL_USER}
+          - DEST_MYSQL_PASSWORD=${INTERMEDIATE_MYSQL_PASSWORD}
+          - DEST_MYSQL_PORT=${INTERMEDIATE_MYSQL_PORT}
+          - DEST_MYSQL_DB=${INTERMEDIATE_MYSQL_DB}
+        volumes:
+          - ./data:/app/data
+          - ./logs:/app/logs
+        depends_on:
+          manager:
+            condition: service_started
+        command: tail -f /dev/null
+        networks:
+          - etl_network
+    
+      transformer:
+        build:
+          context: ./transformer
+          dockerfile: Dockerfile
+        environment:
+          - SOURCE_MYSQL_HOST=${INTERMEDIATE_MYSQL_HOST}
+          - SOURCE_MYSQL_USER=${INTERMEDIATE_MYSQL_USER}
+          - SOURCE_MYSQL_PASSWORD=${INTERMEDIATE_MYSQL_PASSWORD}
+          - SOURCE_MYSQL_PORT=${INTERMEDIATE_MYSQL_PORT}
+          - SOURCE_MYSQL_DB=${INTERMEDIATE_MYSQL_DB}
+          - DEST_MYSQL_HOST=${DEST_MYSQL_HOST}
+          - DEST_MYSQL_USER=${DEST_MYSQL_USER}
+          - DEST_MYSQL_PASSWORD=${DEST_MYSQL_PASSWORD}
+          - DEST_MYSQL_PORT=${DEST_MYSQL_PORT}
+          - DEST_MYSQL_DB_5MIN=${DEST_MYSQL_DB_5MIN}
+          - DEST_MYSQL_DB_15MIN=${DEST_MYSQL_DB_15MIN}
+          - DEST_MYSQL_DB_MGW=${DEST_MYSQL_DB_MGW}
+        volumes:
+          - ./data:/app/data
+          - ./logs:/app/logs
+        depends_on:
+          extractor:
+            condition: service_started
+        command: tail -f /dev/null
+        networks:
+          - etl_network
+    
+    networks:
+      etl_network:
+        driver: bridge
+

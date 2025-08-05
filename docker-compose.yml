@@ -1,0 +1,72 @@
+services:
+  manager:
+    build:
+      context: ./manager
+      dockerfile: Dockerfile
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=mysql+pymysql://${AIRFLOW_MYSQL_USER}:${AIRFLOW_MYSQL_PASSWORD}@${AIRFLOW_MYSQL_HOST}:${AIRFLOW_MYSQL_PORT}/${AIRFLOW_MYSQL_DB}
+    volumes:
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    networks:
+      - etl_network
+
+  extractor:
+    build:
+      context: ./extractor
+      dockerfile: Dockerfile
+    environment:
+      - SOURCE_MYSQL_HOST=${SOURCE_MYSQL_HOST}
+      - SOURCE_MYSQL_USER=${SOURCE_MYSQL_USER}
+      - SOURCE_MYSQL_PASSWORD=${SOURCE_MYSQL_PASSWORD}
+      - SOURCE_MYSQL_PORT=${SOURCE_MYSQL_PORT}
+      - SOURCE_MYSQL_DB=${SOURCE_MYSQL_DB}
+      - DEST_MYSQL_HOST=${INTERMEDIATE_MYSQL_HOST}
+      - DEST_MYSQL_USER=${INTERMEDIATE_MYSQL_USER}
+      - DEST_MYSQL_PASSWORD=${INTERMEDIATE_MYSQL_PASSWORD}
+      - DEST_MYSQL_PORT=${INTERMEDIATE_MYSQL_PORT}
+      - DEST_MYSQL_DB=${INTERMEDIATE_MYSQL_DB}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      manager:
+        condition: service_started
+    command: tail -f /dev/null
+    networks:
+      - etl_network
+
+  transformer:
+    build:
+      context: ./transformer
+      dockerfile: Dockerfile
+    environment:
+      - SOURCE_MYSQL_HOST=${INTERMEDIATE_MYSQL_HOST}
+      - SOURCE_MYSQL_USER=${INTERMEDIATE_MYSQL_USER}
+      - SOURCE_MYSQL_PASSWORD=${INTERMEDIATE_MYSQL_PASSWORD}
+      - SOURCE_MYSQL_PORT=${INTERMEDIATE_MYSQL_PORT}
+      - SOURCE_MYSQL_DB=${INTERMEDIATE_MYSQL_DB}
+      - DEST_MYSQL_HOST=${DEST_MYSQL_HOST}
+      - DEST_MYSQL_USER=${DEST_MYSQL_USER}
+      - DEST_MYSQL_PASSWORD=${DEST_MYSQL_PASSWORD}
+      - DEST_MYSQL_PORT=${DEST_MYSQL_PORT}
+      - DEST_MYSQL_DB_5MIN=${DEST_MYSQL_DB_5MIN}
+      - DEST_MYSQL_DB_15MIN=${DEST_MYSQL_DB_15MIN}
+      - DEST_MYSQL_DB_MGW=${DEST_MYSQL_DB_MGW}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      extractor:
+        condition: service_started
+    command: tail -f /dev/null
+    networks:
+      - etl_network
+
+networks:
+  etl_network:
+    driver: bridge
